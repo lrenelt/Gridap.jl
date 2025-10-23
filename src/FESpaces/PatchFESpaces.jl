@@ -12,6 +12,90 @@ end
 FESpaceWithoutBCs(space::ConstantFESpace) = space
 FESpaceWithoutBCs(space::TrialFESpace) = FESpaceWithoutBCs(space.space)
 
+function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
+  vector_type = get_vector_type(space)
+
+  nfree = num_free_dofs(space)
+  patch_cell_ids = ptopo.d_to_patch_to_dfaces[3]
+  global_cell_dof_ids = get_cell_dof_ids(space)
+
+  model = get_background_model(get_triangulation(space))
+
+  global_fe_basis = get_fe_basis(space)
+  global_cell_basis = get_data(global_fe_basis)
+
+  global_fe_dof_basis = get_fe_dof_basis(space)
+  global_cell_dofs = get_data(global_fe_dof_basis)
+
+  basis_style = BasisStyle(global_fe_basis)
+
+  # global constraints
+  ndirichlet = num_dirichlet_dofs(space)
+  dirichlet_dof_tag = get_dirichlet_dof_tag(space)
+  ntags = num_dirichlet_tags(space)
+
+  npatches = length(patch_cell_ids)
+  spaces = Vector{UnconstrainedFESpace}(undef,npatches)
+  for patch in 1:npatches
+    local_cell_ids = patch_cell_ids[patch]
+
+    trian = Triangulation(model, collect(local_cell_ids))
+
+    local_fe_basis = SingleFieldFEBasis(
+      getindex(global_cell_basis, local_cell_ids),
+      trian,
+      basis_style,
+      ReferenceDomain()
+    )
+
+    local_fe_dof_basis = CellDof(
+      getindex(global_cell_dofs, local_cell_ids),
+      trian,
+      ReferenceDomain()
+      )
+
+    # TODO add internal dirichlet constraints
+
+    local_cell_dof_ids = getindex(global_cell_dof_ids, local_cell_ids)
+    patch_dof_ids = sort(unique(vcat(local_cell_dof_ids...)))
+
+    # renumbering into patch-local indices
+    nfree = sum(i -> i > 0, patch_dof_ids)
+    ndirichlet = sum(i -> i < 0, patch_dof_ids)
+    local_dof_numbering = Array{Int32}([-ndirichlet:-1;1:nfree])
+    g2l_dof_numbering = Dict{Int32,Int32}(zip(patch_dof_ids,local_dof_numbering))
+    l2g_dof_numering = Dict{Int32,Int32}(zip(local_dof_numbering, patch_dof_ids))
+
+    patch_cell_dof_ids = lazy_map(I -> map(i->get(g2l_dof_numbering,i,missing),I),local_cell_dof_ids)
+
+    cell_has_dirichlet_dof = collect(Bool,lazy_map(I -> any(i -> i < 0, I), patch_cell_dof_ids))
+    dirichlet_cell_ids = collect(Int32,findall(cell_has_dirichlet_dof))
+
+    dirichlet_dof_tag = ones(Int8, ndirichlet) # temporary
+    ntags = length(dirichlet_dof_tag) # temporary
+
+    metadata = (ptopo, patch, l2g_dof_numering, g2l_dof_numbering)
+
+    localSpace =
+    UnconstrainedFESpace(
+      vector_type,
+      nfree,
+      ndirichlet,
+      patch_cell_dof_ids,
+      local_fe_basis,
+      local_fe_dof_basis,
+      cell_has_dirichlet_dof,
+      dirichlet_dof_tag, # TODO verify
+      dirichlet_cell_ids,
+      ntags, # TODO verify
+      metadata # ?
+    )
+
+    spaces[patch] = localSpace
+  end
+  return spaces
+end
+
 function PatchFESpace(space::SingleFieldFESpace, ptopo::PatchTopology)
   vector_type = get_vector_type(space)
 

@@ -71,8 +71,7 @@ function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
   vertex_to_edge = Geometry.get_faces(topo, 0, 1)
 
   D = Geometry.num_cell_dims(ptopo)
-   # TODO this is kinda hacky, add at least a check here
-  d_to_ctype_to_ldface_to_own_ldofs = space.metadata.d_ctype_ldface_own_ldofs
+  d_to_ctype_to_ldface_to_own_ldofs = get_cell_conformity(space).d_ctype_ldface_own_ldofs
 
   npatches = length(patch_cell_ids)
   spaces = Vector{UnconstrainedFESpace}(undef,npatches)

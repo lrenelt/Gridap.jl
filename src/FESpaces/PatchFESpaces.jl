@@ -33,18 +33,6 @@ function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
   patch_edge_ids = Geometry.get_patch_facets(ptopo)
   patch_vertex_ids = Geometry.get_patch_faces(ptopo,0)
 
-  #=
-  function get_offsets(ptopo::PatchTopology{Dc}) where Dc
-    offsets = zeros(Int, Dc)
-    temp = 0
-    for d in 1:Dc
-      offsets[d] = temp
-      temp += num_faces(ptopo,d)
-    end
-    return offsets
-  end
-  =#
-
   global_cell_dof_ids = get_cell_dof_ids(space)
 
   model = get_background_model(get_triangulation(space))
@@ -69,6 +57,7 @@ function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
   edge_to_vertex = Geometry.get_faces(topo, 1, 0)
   cell_to_edge = Geometry.get_faces(topo, 2, 1)
   vertex_to_edge = Geometry.get_faces(topo, 0, 1)
+  edge_to_cell = Geometry.get_faces(topo, 1, 2)
 
   D = Geometry.num_cell_dims(ptopo)
   d_to_ctype_to_ldface_to_own_ldofs = get_cell_conformity(space).d_ctype_ldface_own_ldofs
@@ -94,18 +83,21 @@ function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
       )
 
     # identify interior boundary edges
-    # TODO assume no refinement, need to go up hierarchy eventually
     boundary_edges = Vector{Int32}()
     for edge in patch_edge_ids[patch]
-      adjacent_vertices = edge_to_vertex[edge]
-      if patch ∉ adjacent_vertices && ~is_global_boundary[edge]
+      # internal boundary edges have an adjacent cell outside the patch
+      # and are not a global boundary edge already
+      if ~all([cell in local_cell_ids for cell in edge_to_cell[edge]]) && ~is_global_boundary[edge]
           push!(boundary_edges, edge)
       end
     end
 
     boundary_vertices = Vector{Int32}()
     for vtx in patch_vertex_ids[patch]
-      if all([e in boundary_edges for e in vertex_to_edge[vtx]])
+      adjacent_edges = vertex_to_edge[vtx]
+      # internal boundary vertices have one adjacent boundary edge
+      # but no global boundary edge
+      if any([e in boundary_edges for e in adjacent_edges]) && all([~is_global_boundary[e] for e in adjacent_edges])
         push!(boundary_vertices, vtx)
       end
     end
@@ -148,7 +140,6 @@ function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
 
     # create tags
     # TODO slightly hacky and inefficient
-    # TODO missing constrained vertices
     d_to_dface_to_tag = Array{Vector{Int}}(undef,D+1)
     for d in 0:D
       if d != D
@@ -222,7 +213,7 @@ function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
 
     spaces[patch] = localSpace
   end
-  return spaces
+  spaces
 end
 
 function PatchFESpace(space::SingleFieldFESpace, ptopo::PatchTopology)

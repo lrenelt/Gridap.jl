@@ -12,6 +12,210 @@ end
 FESpaceWithoutBCs(space::ConstantFESpace) = space
 FESpaceWithoutBCs(space::TrialFESpace) = FESpaceWithoutBCs(space.space)
 
+# Index mapping from global to local (consecutive) indices
+struct Global2Local
+  g2l::Dict{Int32,Int32}
+end
+
+function Global2Local(globalIds::Vector{Int32})
+  Global2Local(Dict(g => l for (l,g) in enumerate(globalIds)))
+end
+
+function (g2l::Global2Local)(gidx)
+  get(g2l.g2l,gidx,missing)
+end
+
+function PatchFESpaces(space::SingleFieldFESpace,ptopo::PatchTopology)
+  vector_type = get_vector_type(space)
+
+  nfree = num_free_dofs(space)
+  patch_cell_ids = Geometry.get_patch_cells(ptopo)
+  patch_edge_ids = Geometry.get_patch_facets(ptopo)
+  patch_vertex_ids = Geometry.get_patch_faces(ptopo,0)
+
+  global_cell_dof_ids = get_cell_dof_ids(space)
+
+  model = get_background_model(get_triangulation(space))
+
+  global_fe_basis = get_fe_basis(space)
+  global_cell_basis = get_data(global_fe_basis)
+
+  global_fe_dof_basis = get_fe_dof_basis(space)
+  global_cell_dofs = get_data(global_fe_dof_basis)
+
+  basis_style = BasisStyle(global_fe_basis)
+
+  # global constraints
+  ndirichlet = num_dirichlet_dofs(space)
+  dirichlet_dof_tag = get_dirichlet_dof_tag(space)
+  ntags = num_dirichlet_tags(space)
+
+  # information for local geometry
+  topo = get_grid_topology(model)
+  labels = get_face_labeling(model)
+  is_global_boundary = get_face_mask(labels, "boundary", 1)
+  edge_to_vertex = Geometry.get_faces(topo, 1, 0)
+  cell_to_edge = Geometry.get_faces(topo, 2, 1)
+  vertex_to_edge = Geometry.get_faces(topo, 0, 1)
+  edge_to_cell = Geometry.get_faces(topo, 1, 2)
+
+  D = Geometry.num_cell_dims(ptopo)
+  d_to_ctype_to_ldface_to_own_ldofs = get_cell_conformity(space).d_ctype_ldface_own_ldofs
+
+  npatches = length(patch_cell_ids)
+  spaces = Vector{UnconstrainedFESpace}(undef,npatches)
+  for patch in 1:npatches
+    local_cell_ids = patch_cell_ids[patch]
+
+    trian = Triangulation(model, collect(local_cell_ids))
+
+    local_fe_basis = SingleFieldFEBasis(
+      getindex(global_cell_basis, local_cell_ids),
+      trian,
+      basis_style,
+      ReferenceDomain()
+    )
+
+    local_fe_dof_basis = CellDof(
+      getindex(global_cell_dofs, local_cell_ids),
+      trian,
+      ReferenceDomain()
+      )
+
+    # identify interior boundary edges
+    boundary_edges = Vector{Int32}()
+    for edge in patch_edge_ids[patch]
+      # internal boundary edges have an adjacent cell outside the patch
+      # and are not a global boundary edge already
+      if ~all([cell in local_cell_ids for cell in edge_to_cell[edge]]) && ~is_global_boundary[edge]
+          push!(boundary_edges, edge)
+      end
+    end
+
+    boundary_vertices = Vector{Int32}()
+    for vtx in patch_vertex_ids[patch]
+      adjacent_edges = vertex_to_edge[vtx]
+      # internal boundary vertices have one adjacent boundary edge
+      # but no global boundary edge
+      if any([e in boundary_edges for e in adjacent_edges]) && all([~is_global_boundary[e] for e in adjacent_edges])
+        push!(boundary_vertices, vtx)
+      end
+    end
+
+    # Global/Local face identification
+    d_to_dface_ids = [Geometry.get_patch_faces(ptopo,d)[patch] for d in 0:D]
+    
+    d_to_g2l = [Global2Local(ids) for ids in d_to_dface_ids]
+    d_to_l2g = [Reindex(ids) for ids in d_to_dface_ids]
+
+    d_to_num_dfaces = length.(d_to_dface_ids)
+    n_faces = sum(d_to_num_dfaces)
+    cell_to_ctype = getindex(get_cell_type(topo), local_cell_ids)
+
+    # mappings in local enumeration
+    d_to_cell_to_dfaces = [Table([map(d_to_g2l[d+1], dfaces)
+      for dfaces in getindex(get_faces(topo,D,d),local_cell_ids)])
+      for d in 0:D]
+    
+    d_to_dface_to_cells = [ getindex(get_faces(topo,d,D),d_to_dface_ids[d+1]) for d in 0:D]
+    d_to_dface_to_cells = [ Table([map(d_to_g2l[D+1], filter(i -> i in local_cell_ids, cells))
+     for cells in d_to_dface_to_cells[d+1]])
+     for d in 0:D ]
+    
+    # TODO pull out into function
+    d_to_offset = cumsum(d_to_num_dfaces) .- d_to_num_dfaces
+
+    # generate patch-local dof mappings
+    face_to_own_dofs, ntotal, d_to_dface_to_cell, d_to_dface_to_ldface =  FESpaces._generate_face_to_own_dofs(
+      n_faces,
+      cell_to_ctype,
+      d_to_cell_to_dfaces,
+      d_to_dface_to_cells,
+      d_to_offset,
+      d_to_ctype_to_ldface_to_own_ldofs)
+
+    # extract patch-local dofs (global numbering)
+    local_cell_dof_ids = getindex(global_cell_dof_ids, local_cell_ids)
+    patch_dof_ids = sort(unique(vcat(local_cell_dof_ids...)))
+
+    # create tags
+    # TODO slightly hacky and inefficient
+    d_to_dface_to_tag = Array{Vector{Int}}(undef,D+1)
+    for d in 0:D
+      if d != D
+        # set global boundary tags
+        d_to_dface_to_tag[d+1] = getindex(get_isboundary_face(topo,d), d_to_dface_ids[d+1])
+      else
+        d_to_dface_to_tag[d+1] = fill(Int(UNSET), d_to_num_dfaces[d+1])
+      end
+      if d == 0
+        # internal vertices
+        # TODO vectorize
+        for vi in map(d_to_g2l[d+1],boundary_vertices)
+          d_to_dface_to_tag[d+1][vi] = 2
+        end
+      end
+      if d == D-1
+        # internal edges
+        # TODO vectorize
+        for li in map(d_to_g2l[d+1],boundary_edges)
+          d_to_dface_to_tag[d+1][li] = 2
+        end
+      end
+    end
+
+    # create local dof numbering
+    nfree, ndirichlet, dirichlet_dof_tag = FESpaces._split_face_own_dofs_into_free_and_dirichlet_generic!(
+      face_to_own_dofs,
+      d_to_offset,
+      d_to_dface_to_tag)
+
+    # renumbering into patch-local indices
+    g2l_dof_numbering = Dict{Int32,Int32}()
+    l2g_dof_numbering = Dict{Int32,Int32}()
+    for d in 0:D
+      offset = d_to_offset[d+1]
+      for face in 1:d_to_num_dfaces[d+1]
+        dface = offset+face
+        pdofs = face_to_own_dofs[dface]
+        cell = d_to_dface_to_cell[d+1][face]
+        ldface = d_to_dface_to_ldface[d+1][face]
+        ctype = cell_to_ctype[cell]
+        own_ldofs = d_to_ctype_to_ldface_to_own_ldofs[d+1][ctype][ldface]
+        own_gdofs = getindex(local_cell_dof_ids[cell],own_ldofs)
+        merge!(l2g_dof_numbering, Dict(zip(pdofs,own_gdofs)))
+        merge!(g2l_dof_numbering, Dict(zip(own_gdofs,pdofs)))
+      end
+    end
+
+    # get additional info for local space construction
+    patch_cell_dof_ids = lazy_map(I -> map(i->get(g2l_dof_numbering,i,missing),I),local_cell_dof_ids)
+    cell_has_dirichlet_dof = collect(Bool,lazy_map(I -> any(i -> i < 0, I), patch_cell_dof_ids))
+    dirichlet_cell_ids = collect(Int32,findall(cell_has_dirichlet_dof))
+    ntags = length(dirichlet_dof_tag)
+
+    metadata = (ptopo, patch, l2g_dof_numbering, g2l_dof_numbering)
+
+    localSpace =
+    UnconstrainedFESpace(
+      vector_type,
+      nfree,
+      ndirichlet,
+      patch_cell_dof_ids,
+      local_fe_basis,
+      local_fe_dof_basis,
+      cell_has_dirichlet_dof,
+      dirichlet_dof_tag,
+      dirichlet_cell_ids,
+      ntags,
+      metadata
+    )
+
+    spaces[patch] = localSpace
+  end
+  spaces
+end
+
 function PatchFESpace(space::SingleFieldFESpace, ptopo::PatchTopology)
   vector_type = get_vector_type(space)
 
